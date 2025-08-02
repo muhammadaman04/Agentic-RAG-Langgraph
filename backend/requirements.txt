@@ -3,3 +3,13 @@ uvicorn
 python-multipart
 python-multipart
 aiofiles
+pymupdf
+pillow
+google-generativeai
+pinecone
+langchain
+python-docx
+docx2txt
+transformers
+torch
+langchain-community
