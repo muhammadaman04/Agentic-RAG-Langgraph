@@ -13,3 +13,5 @@ docx2txt
 transformers
 torch
 langchain-community
+sentence-transformers
+pypdf
