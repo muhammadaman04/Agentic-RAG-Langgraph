@@ -1,14 +1,12 @@
-
-
 import os
 import io
 import base64
 from typing import List, Dict, Any, Tuple, Union, Optional
 import uuid
 from pathlib import Path
-import logging
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 
 # Core libraries
 import fitz  # PyMuPDF
@@ -23,10 +21,6 @@ from langchain.schema import Document
 from langchain.document_loaders import PyPDFLoader, Docx2txtLoader, TextLoader
 from langchain.document_loaders.base import BaseLoader
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
 # Configuration
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 SUPPORTED_EXTENSIONS = {'.pdf', '.docx', '.doc', '.txt'}
@@ -35,50 +29,113 @@ class IngestionError(Exception):
     """Custom exception for ingestion errors"""
     pass
 
-def create_clients(pinecone_api_key: str, 
-                  pinecone_index_name: str, 
-                  gemini_api_key: str,
-                  embedding_model_name: str = EMBEDDING_MODEL):
-    """Create and return all necessary clients"""
-    try:
-        # Initialize Pinecone
-        logger.info("Creating Pinecone client...")
-        pc = Pinecone(api_key=pinecone_api_key)
+class MultimodalRAGClient:
+    """
+    Centralized client manager for Multimodal RAG system
+    This should be initialized once and reused across requests
+    """
+    def __init__(self, pinecone_api_key: str, pinecone_index_name: str, 
+                 gemini_api_key: str, embedding_model_name: str = EMBEDDING_MODEL):
+        self.pinecone_api_key = pinecone_api_key
+        self.pinecone_index_name = pinecone_index_name
+        self.gemini_api_key = gemini_api_key
+        self.embedding_model_name = embedding_model_name
         
-        # Check if index exists, create if not
-        if pinecone_index_name not in pc.list_indexes().names():
-            logger.info(f"Creating Pinecone index: {pinecone_index_name}")
-            pc.create_index(
-                name=pinecone_index_name,
-                dimension=384,  # Dimension for all-MiniLM-L6-v2
-                metric='cosine',
-                spec=pc.ServerlessSpec(
-                    cloud='aws',
-                    region='us-east-1'
+        # Initialize clients
+        self._initialize_clients()
+    
+    def _initialize_clients(self):
+        """Initialize all necessary clients"""
+        try:
+            print("Initializing MultimodalRAGClient...")
+            
+            # Initialize Pinecone
+            print("Creating Pinecone client...")
+            self.pc = Pinecone(api_key=self.pinecone_api_key)
+            
+            # Check if index exists, create if not
+            if self.pinecone_index_name not in self.pc.list_indexes().names():
+                print(f"Creating Pinecone index: {self.pinecone_index_name}")
+                self.pc.create_index(
+                    name=self.pinecone_index_name,
+                    dimension=384,  # Dimension for all-MiniLM-L6-v2
+                    metric='cosine',
+                    spec=self.pc.ServerlessSpec(
+                        cloud='aws',
+                        region='us-east-1'
+                    )
                 )
+            
+            self.pinecone_index = self.pc.Index(self.pinecone_index_name)
+            
+            # Initialize Gemini
+            print("Creating Gemini client...")
+            genai.configure(api_key=self.gemini_api_key)
+            self.gemini_model = genai.GenerativeModel('gemini-2.0-flash-exp')
+            
+            # Initialize embedding model
+            print(f"Creating embedding model: {self.embedding_model_name}")
+            self.embedding_model = HuggingFaceEmbeddings(
+                model_name=self.embedding_model_name,
+                model_kwargs={'device': 'cpu'},  # Change to 'cuda' if you have GPU
+                encode_kwargs={'normalize_embeddings': True}
             )
-        
-        pinecone_index = pc.Index(pinecone_index_name)
-        
-        # Initialize Gemini
-        logger.info("Creating Gemini client...")
-        genai.configure(api_key=gemini_api_key)
-        gemini_model = genai.GenerativeModel('gemini-2.0-flash-exp')
-        
-        # Initialize embedding model
-        logger.info(f"Creating embedding model: {embedding_model_name}")
-        embedding_model = HuggingFaceEmbeddings(
-            model_name=embedding_model_name,
-            model_kwargs={'device': 'cpu'},  # Change to 'cuda' if you have GPU
-            encode_kwargs={'normalize_embeddings': True}
-        )
-        
-        logger.info("All clients created successfully")
-        return pinecone_index, gemini_model, embedding_model
-        
-    except Exception as e:
-        logger.error(f"Error creating clients: {e}")
-        raise IngestionError(f"Failed to create clients: {e}")
+            
+            print("MultimodalRAGClient initialized successfully")
+            
+        except Exception as e:
+            print(f"Error initializing clients: {e}")
+            raise IngestionError(f"Failed to initialize clients: {e}")
+    
+    def get_user_namespace(self, user_id: str) -> str:
+        """Generate consistent namespace for user"""
+        # Create a hash of user_id to ensure consistent namespace naming
+        # and avoid issues with special characters
+        user_hash = hashlib.md5(str(user_id).encode()).hexdigest()[:8]
+        return f"user_{user_hash}"
+    
+    def list_user_namespaces(self) -> List[str]:
+        """List all user namespaces in the index"""
+        try:
+            stats = self.pinecone_index.describe_index_stats()
+            namespaces = list(stats.get('namespaces', {}).keys())
+            # Filter only user namespaces
+            user_namespaces = [ns for ns in namespaces if ns.startswith('user_')]
+            return user_namespaces
+        except Exception as e:
+            print(f"Error listing namespaces: {e}")
+            return []
+    
+    def get_namespace_stats(self, namespace: str) -> Dict[str, Any]:
+        """Get statistics for a specific namespace"""
+        try:
+            stats = self.pinecone_index.describe_index_stats()
+            namespace_stats = stats.get('namespaces', {}).get(namespace, {})
+            return {
+                'vector_count': namespace_stats.get('vector_count', 0),
+                'namespace': namespace
+            }
+        except Exception as e:
+            print(f"Error getting namespace stats: {e}")
+            return {'vector_count': 0, 'namespace': namespace}
+    
+    def clear_user_namespace(self, user_id: str) -> Dict[str, Any]:
+        """Clear all vectors for a specific user"""
+        try:
+            namespace = self.get_user_namespace(user_id)
+            self.pinecone_index.delete(delete_all=True, namespace=namespace)
+            print(f"Cleared namespace {namespace} for user {user_id}")
+            return {
+                'success': True,
+                'message': f'Cleared all documents for user {user_id}',
+                'namespace': namespace
+            }
+        except Exception as e:
+            print(f"Error clearing user namespace: {e}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
 
 def get_document_loader(file_path: str) -> BaseLoader:
     """Get appropriate LangChain loader based on file extension"""
@@ -102,11 +159,11 @@ def load_documents_with_langchain(file_paths: List[str]) -> List[Document]:
     failed_files = []
     
     for file_path in file_paths:
-        logger.info(f"Loading {file_path} with LangChain loader...")
+        print(f"Loading {file_path} with LangChain loader...")
         
         try:
             if not os.path.exists(file_path):
-                logger.error(f"File not found: {file_path}")
+                print(f"File not found: {file_path}")
                 failed_files.append(file_path)
                 continue
                 
@@ -120,15 +177,15 @@ def load_documents_with_langchain(file_paths: List[str]) -> List[Document]:
                 doc.metadata['file_name'] = Path(file_path).name
             
             all_docs.extend(docs)
-            logger.info(f"Loaded {len(docs)} pages/sections from {Path(file_path).name}")
+            print(f"Loaded {len(docs)} pages/sections from {Path(file_path).name}")
             
         except Exception as e:
-            logger.error(f"Error loading {file_path}: {e}")
+            print(f"Error loading {file_path}: {e}")
             failed_files.append(file_path)
             continue
     
     if failed_files:
-        logger.warning(f"Failed to load {len(failed_files)} files: {failed_files}")
+        print(f"Failed to load {len(failed_files)} files: {failed_files}")
     
     if not all_docs:
         raise IngestionError("No documents were loaded successfully")
@@ -157,7 +214,7 @@ def extract_images_from_pdf(pdf_path: str) -> Dict[int, List[bytes]]:
                             images_data.append(img_data)
                         pix = None
                     except Exception as e:
-                        logger.error(f"Error extracting image {img_index} from page {page_num + 1}: {e}")
+                        print(f"Error extracting image {img_index} from page {page_num + 1}: {e}")
             
             if images_data:
                 page_images[page_num] = images_data
@@ -166,7 +223,7 @@ def extract_images_from_pdf(pdf_path: str) -> Dict[int, List[bytes]]:
         return page_images
         
     except Exception as e:
-        logger.error(f"Error extracting images from PDF {pdf_path}: {e}")
+        print(f"Error extracting images from PDF {pdf_path}: {e}")
         return {}
 
 def perform_ocr_with_gemini(image_data: bytes, gemini_model) -> str:
@@ -192,7 +249,7 @@ def perform_ocr_with_gemini(image_data: bytes, gemini_model) -> str:
         return response.text.strip() if response.text else ""
         
     except Exception as e:
-        logger.error(f"Error performing OCR: {e}")
+        print(f"Error performing OCR: {e}")
         return ""
 
 def enhance_documents_with_ocr(documents: List[Document], gemini_model) -> List[Document]:
@@ -210,18 +267,18 @@ def enhance_documents_with_ocr(documents: List[Document], gemini_model) -> List[
             source_file = doc.metadata['source_file']
             page_num = doc.metadata.get('page', 0)
             
-            logger.info(f"Checking for images in {Path(source_file).name}, page {page_num + 1}...")
+            print(f"Checking for images in {Path(source_file).name}, page {page_num + 1}...")
             
             # Extract images from this specific page
             try:
                 page_images = extract_images_from_pdf(source_file)
                 
                 if page_num in page_images:
-                    logger.info(f"Found {len(page_images[page_num])} images on page {page_num + 1}")
+                    print(f"Found {len(page_images[page_num])} images on page {page_num + 1}")
                     
                     ocr_texts = []
                     for i, img_data in enumerate(page_images[page_num]):
-                        logger.info(f"Performing OCR on image {i + 1}...")
+                        print(f"Performing OCR on image {i + 1}...")
                         ocr_text = perform_ocr_with_gemini(img_data, gemini_model)
                         if ocr_text:
                             ocr_texts.append(ocr_text)
@@ -239,10 +296,10 @@ def enhance_documents_with_ocr(documents: List[Document], gemini_model) -> List[
                         enhanced_doc.metadata['has_ocr'] = True
                         enhanced_doc.metadata['ocr_images_count'] = len(ocr_texts)
                         
-                        logger.info(f"Enhanced page with {len(ocr_texts)} OCR texts")
+                        print(f"Enhanced page with {len(ocr_texts)} OCR texts")
             
             except Exception as e:
-                logger.error(f"Error processing images for {source_file}: {e}")
+                print(f"Error processing images for {source_file}: {e}")
                 enhanced_doc.metadata['has_ocr'] = False
         else:
             enhanced_doc.metadata['has_ocr'] = False
@@ -251,7 +308,7 @@ def enhance_documents_with_ocr(documents: List[Document], gemini_model) -> List[
     
     return enhanced_docs
 
-def create_embeddings_and_chunks(documents: List[Document], embedding_model) -> List[Dict[str, Any]]:
+def create_embeddings_and_chunks(documents: List[Document], embedding_model, user_id: str) -> List[Dict[str, Any]]:
     """Create text chunks and embeddings for vector store"""
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=1000,
@@ -261,13 +318,13 @@ def create_embeddings_and_chunks(documents: List[Document], embedding_model) -> 
     
     all_chunks = []
     
-    logger.info(f"Processing {len(documents)} documents for chunking and embedding...")
+    print(f"Processing {len(documents)} documents for chunking and embedding...")
     
     for doc_idx, doc in enumerate(documents):
         if not doc.page_content.strip():
             continue
         
-        logger.info(f"Processing document {doc_idx + 1}/{len(documents)}: {doc.metadata.get('file_name', 'Unknown')}")
+        print(f"Processing document {doc_idx + 1}/{len(documents)}: {doc.metadata.get('file_name', 'Unknown')}")
         
         # Split into chunks
         chunks = text_splitter.split_documents([doc])
@@ -286,26 +343,30 @@ def create_embeddings_and_chunks(documents: List[Document], embedding_model) -> 
                         **chunk.metadata,
                         'chunk_index': i,
                         'total_chunks_in_doc': len(chunks),
-                        'document_index': doc_idx
+                        'document_index': doc_idx,
+                        'user_id': user_id,  # Add user_id to metadata
+                        'upload_timestamp': str(pd.Timestamp.now()) if 'pd' in globals() else str(uuid.uuid4())
                     }
                 }
                 
                 all_chunks.append(chunk_data)
                 
             except Exception as e:
-                logger.error(f"Error creating embedding for chunk {i} in document {doc_idx}: {e}")
+                print(f"Error creating embedding for chunk {i} in document {doc_idx}: {e}")
                 continue
         
-        logger.info(f"Created {len(chunks)} chunks from this document")
+        print(f"Created {len(chunks)} chunks from this document")
     
     return all_chunks
 
-def store_in_pinecone(chunks: List[Dict[str, Any]], pinecone_index):
-    """Store embeddings in Pinecone vector database"""
+def store_in_pinecone_with_namespace(chunks: List[Dict[str, Any]], rag_client: MultimodalRAGClient, 
+                                   user_id: str):
+    """Store embeddings in Pinecone vector database with user namespace"""
     if not chunks:
         raise IngestionError("No chunks to store")
     
-    logger.info(f"Storing {len(chunks)} chunks in Pinecone...")
+    namespace = rag_client.get_user_namespace(user_id)
+    print(f"Storing {len(chunks)} chunks in Pinecone namespace: {namespace}")
     
     # Prepare vectors for upsert
     vectors = []
@@ -326,28 +387,29 @@ def store_in_pinecone(chunks: List[Dict[str, Any]], pinecone_index):
                 'chunk_index': chunk['metadata']['chunk_index'],
                 'has_ocr': chunk['metadata'].get('has_ocr', False),
                 'ocr_images_count': chunk['metadata'].get('ocr_images_count', 0),
-                'document_index': chunk['metadata'].get('document_index', 0)
+                'document_index': chunk['metadata'].get('document_index', 0),
+                'user_id': user_id
             }
         }
         vectors.append(vector)
     
-    # Upsert in batches
+    # Upsert in batches with namespace
     batch_size = 100
     failed_batches = 0
     
     for i in range(0, len(vectors), batch_size):
         batch = vectors[i:i + batch_size]
         try:
-            pinecone_index.upsert(vectors=batch)
-            logger.info(f"Upserted batch {i//batch_size + 1}/{(len(vectors) + batch_size - 1)//batch_size}")
+            rag_client.pinecone_index.upsert(vectors=batch, namespace=namespace)
+            print(f"Upserted batch {i//batch_size + 1}/{(len(vectors) + batch_size - 1)//batch_size} to namespace {namespace}")
         except Exception as e:
-            logger.error(f"Error upserting batch {i//batch_size + 1}: {e}")
+            print(f"Error upserting batch {i//batch_size + 1}: {e}")
             failed_batches += 1
     
     if failed_batches > 0:
-        logger.warning(f"Failed to upsert {failed_batches} batches")
+        print(f"Failed to upsert {failed_batches} batches")
     
-    logger.info("Successfully stored embeddings in Pinecone!")
+    print(f"Successfully stored embeddings in Pinecone namespace: {namespace}!")
 
 def validate_file_paths(file_paths: List[str]) -> List[str]:
     """Validate file paths and filter supported extensions"""
@@ -358,148 +420,130 @@ def validate_file_paths(file_paths: List[str]) -> List[str]:
         
         # Check if file exists
         if not os.path.exists(file_path):
-            logger.warning(f"File not found: {file_path}")
+            print(f"File not found: {file_path}")
             continue
         
         # Check if file extension is supported
         file_extension = Path(file_path).suffix.lower()
         if file_extension not in SUPPORTED_EXTENSIONS:
-            logger.warning(f"Unsupported file type {file_extension}: {file_path}")
+            print(f"Unsupported file type {file_extension}: {file_path}")
             continue
         
         valid_files.append(file_path)
     
     return valid_files
 
-def ingest_documents(file_paths: List[str], 
-                    enable_ocr: bool = True,
-                    pinecone_api_key: str = None,
-                    pinecone_index_name: str = "multimodal-rag",
-                    gemini_api_key: str = None) -> Dict[str, Any]:
+def ingest_documents_for_user(file_paths: List[str], 
+                             user_id: str,
+                             rag_client: MultimodalRAGClient,
+                             enable_ocr: bool = True) -> Dict[str, Any]:
     """
-    Main function to ingest multiple documents into the RAG system
+    Main function to ingest multiple documents for a specific user
     """
     try:
-        logger.info("="*60)
-        logger.info("MULTIMODAL RAG BATCH INGESTION STARTED")
-        logger.info(f"Processing {len(file_paths)} documents")
-        logger.info("="*60)
-        
-        # Get API keys from environment if not provided
-        if not pinecone_api_key:
-            pinecone_api_key = os.getenv("PINECONE_API_KEY")
-        if not gemini_api_key:
-            gemini_api_key = os.getenv("GEMINI_API_KEY")
-        
-        # Validate API keys
-        if not pinecone_api_key or not gemini_api_key:
-            raise IngestionError("Missing required API keys (PINECONE_API_KEY, GEMINI_API_KEY)")
-        
-        # Create clients for this ingestion session
-        pinecone_index, gemini_model, embedding_model = create_clients(
-            pinecone_api_key=pinecone_api_key,
-            pinecone_index_name=pinecone_index_name,
-            gemini_api_key=gemini_api_key
-        )
+        print("="*60)
+        print("MULTIMODAL RAG USER DOCUMENT INGESTION STARTED")
+        print(f"User ID: {user_id}")
+        print(f"Processing {len(file_paths)} documents")
+        print(f"Namespace: {rag_client.get_user_namespace(user_id)}")
+        print("="*60)
         
         # Validate file paths
         valid_file_paths = validate_file_paths(file_paths)
         if not valid_file_paths:
             raise IngestionError("No valid file paths found")
         
-        logger.info(f"Valid files to process: {len(valid_file_paths)}")
+        print(f"Valid files to process: {len(valid_file_paths)}")
         
         # Load documents using LangChain loaders
-        logger.info("Loading documents with LangChain loaders...")
+        print("Loading documents with LangChain loaders...")
         documents = load_documents_with_langchain(valid_file_paths)
         
         # Enhance with OCR if enabled
         if enable_ocr:
-            logger.info(f"Enhancing {len(documents)} documents with OCR...")
-            documents = enhance_documents_with_ocr(documents, gemini_model)
+            print(f"Enhancing {len(documents)} documents with OCR...")
+            documents = enhance_documents_with_ocr(documents, rag_client.gemini_model)
         else:
-            logger.info("OCR processing disabled, using text-only content...")
+            print("OCR processing disabled, using text-only content...")
             for doc in documents:
                 doc.metadata['has_ocr'] = False
         
         # Create embeddings and chunks
-        logger.info("Creating embeddings and chunks...")
-        chunks = create_embeddings_and_chunks(documents, embedding_model)
+        print("Creating embeddings and chunks...")
+        chunks = create_embeddings_and_chunks(documents, rag_client.embedding_model, user_id)
         
         if not chunks:
             raise IngestionError("No chunks were created")
         
-        # Store in Pinecone
-        store_in_pinecone(chunks, pinecone_index)
+        # Store in Pinecone with user namespace
+        store_in_pinecone_with_namespace(chunks, rag_client, user_id)
         
         # Summary statistics
         pdf_docs = [d for d in documents if d.metadata.get('file_type', '').lower() == '.pdf']
         ocr_enhanced_docs = [d for d in documents if d.metadata.get('has_ocr', False)]
         
+        # Get final namespace stats
+        namespace_stats = rag_client.get_namespace_stats(rag_client.get_user_namespace(user_id))
+        
         result = {
             'success': True,
+            'user_id': user_id,
+            'namespace': rag_client.get_user_namespace(user_id),
             'files_processed': len(valid_file_paths),
             'documents_loaded': len(documents),
             'pdf_documents': len(pdf_docs),
             'ocr_enhanced_documents': len(ocr_enhanced_docs),
             'chunks_created': len(chunks),
+            'total_vectors_in_namespace': namespace_stats['vector_count'],
             'file_types': list(set([Path(fp).suffix.lower() for fp in valid_file_paths])),
             'failed_files': len(file_paths) - len(valid_file_paths)
         }
         
-        logger.info("="*60)
-        logger.info("BATCH INGESTION COMPLETED SUCCESSFULLY!")
-        logger.info(f"Files processed: {result['files_processed']}")
-        logger.info(f"Documents loaded: {result['documents_loaded']}")
-        logger.info(f"PDF documents: {result['pdf_documents']}")
-        logger.info(f"OCR enhanced documents: {result['ocr_enhanced_documents']}")
-        logger.info(f"Total chunks created: {result['chunks_created']}")
-        logger.info("="*60)
+        print("="*60)
+        print("USER DOCUMENT INGESTION COMPLETED SUCCESSFULLY!")
+        print(f"User ID: {result['user_id']}")
+        print(f"Namespace: {result['namespace']}")
+        print(f"Files processed: {result['files_processed']}")
+        print(f"Documents loaded: {result['documents_loaded']}")
+        print(f"PDF documents: {result['pdf_documents']}")
+        print(f"OCR enhanced documents: {result['ocr_enhanced_documents']}")
+        print(f"Chunks created: {result['chunks_created']}")
+        print(f"Total vectors in user namespace: {result['total_vectors_in_namespace']}")
+        print("="*60)
         
         return result
         
     except Exception as e:
-        logger.error(f"Error during ingestion: {e}")
+        print(f"Error during ingestion: {e}")
         return {
             'success': False,
             'error': str(e),
+            'user_id': user_id,
             'files_processed': 0,
             'documents_loaded': 0,
             'chunks_created': 0
         }
 
-def ingest_single_document(file_path: str, 
-                          enable_ocr: bool = True,
-                          pinecone_api_key: str = None,
-                          pinecone_index_name: str = "multimodal-rag",
-                          gemini_api_key: str = None) -> Dict[str, Any]:
-    """Convenience function for single document ingestion"""
-    return ingest_documents(
-        file_paths=[file_path], 
-        enable_ocr=enable_ocr,
-        pinecone_api_key=pinecone_api_key,
-        pinecone_index_name=pinecone_index_name,
-        gemini_api_key=gemini_api_key
-    )
-
-def process_document_folder(folder_path: str, 
-                          file_extensions: List[str] = None,
-                          enable_ocr: bool = True,
-                          pinecone_api_key: str = None,
-                          pinecone_index_name: str = "multimodal-rag",
-                          gemini_api_key: str = None) -> Dict[str, Any]:
+def process_uploaded_files_for_user(upload_folder: str, 
+                                   user_id: str,
+                                   rag_client: MultimodalRAGClient,
+                                   file_extensions: List[str] = None,
+                                   enable_ocr: bool = True,
+                                   cleanup_after_processing: bool = True) -> Dict[str, Any]:
     """
-    Process all documents in a folder automatically
+    Process all uploaded files in a user's upload folder
+    This is the main function you'd call from your API
     """
     if file_extensions is None:
         file_extensions = list(SUPPORTED_EXTENSIONS)
     
-    folder = Path(folder_path)
+    upload_path = Path(upload_folder)
     
-    if not folder.exists():
+    if not upload_path.exists():
         return {
             'success': False,
-            'error': f"Folder {folder_path} does not exist",
+            'error': f"Upload folder {upload_folder} does not exist",
+            'user_id': user_id,
             'files_processed': 0
         }
     
@@ -508,8 +552,8 @@ def process_document_folder(folder_path: str,
     # Find all files with supported extensions
     for ext in file_extensions:
         # Use both case variations to catch files like .PDF, .Pdf, etc.
-        files_to_process.extend(folder.glob(f"*{ext.lower()}"))
-        files_to_process.extend(folder.glob(f"*{ext.upper()}"))
+        files_to_process.extend(upload_path.glob(f"*{ext.lower()}"))
+        files_to_process.extend(upload_path.glob(f"*{ext.upper()}"))
     
     # Remove duplicates and convert to strings
     file_paths = list(set([str(f) for f in files_to_process]))
@@ -517,96 +561,51 @@ def process_document_folder(folder_path: str,
     if not file_paths:
         return {
             'success': False,
-            'error': f"No supported files found in {folder_path}",
+            'error': f"No supported files found in {upload_folder}",
+            'user_id': user_id,
             'files_processed': 0
         }
     
-    logger.info(f"Found {len(file_paths)} files to process:")
+    print(f"Found {len(file_paths)} files to process for user {user_id}:")
     for fp in sorted(file_paths):
-        logger.info(f"  - {Path(fp).name}")
+        print(f"  - {Path(fp).name}")
     
-    return ingest_documents(
+    # Process the documents
+    result = ingest_documents_for_user(
         file_paths=file_paths, 
-        enable_ocr=enable_ocr,
-        pinecone_api_key=pinecone_api_key,
-        pinecone_index_name=pinecone_index_name,
-        gemini_api_key=gemini_api_key
+        user_id=user_id,
+        rag_client=rag_client,
+        enable_ocr=enable_ocr
     )
+    
+    # Cleanup uploaded files if requested and processing was successful
+    if cleanup_after_processing and result.get('success', False):
+        try:
+            for file_path in file_paths:
+                os.remove(file_path)
+                print(f"Cleaned up: {Path(file_path).name}")
+            print("Upload folder cleaned up successfully")
+        except Exception as e:
+            print(f"Warning: Could not cleanup some files: {e}")
+    
+    return result
 
-def check_ingestion_status(pinecone_api_key: str = None,
-                          pinecone_index_name: str = "multimodal-rag") -> Dict[str, Any]:
-    """Check the current status of the vector database"""
+def get_user_documents_info(user_id: str, rag_client: MultimodalRAGClient) -> Dict[str, Any]:
+    """Get information about user's documents"""
     try:
-        # Get API key from environment if not provided
-        if not pinecone_api_key:
-            pinecone_api_key = os.getenv("PINECONE_API_KEY")
-        
-        if not pinecone_api_key:
-            return {
-                'success': False,
-                'error': 'Pinecone API key not provided'
-            }
-        
-        # Create Pinecone client
-        pc = Pinecone(api_key=pinecone_api_key)
-        
-        if pinecone_index_name not in pc.list_indexes().names():
-            return {
-                'success': False,
-                'error': f'Index {pinecone_index_name} does not exist'
-            }
-        
-        index = pc.Index(pinecone_index_name)
-        stats = index.describe_index_stats()
+        namespace = rag_client.get_user_namespace(user_id)
+        stats = rag_client.get_namespace_stats(namespace)
         
         return {
             'success': True,
-            'total_vectors': stats['total_vector_count'],
-            'dimension': stats['dimension'],
-            'index_fullness': stats.get('index_fullness', 0),
-            'namespaces': stats.get('namespaces', {})
+            'user_id': user_id,
+            'namespace': namespace,
+            'total_documents': stats['vector_count'],
+            'index_exists': stats['vector_count'] > 0
         }
     except Exception as e:
-        logger.error(f"Error checking ingestion status: {e}")
         return {
             'success': False,
-            'error': str(e)
-        }
-
-def clear_vector_database(pinecone_api_key: str = None,
-                         pinecone_index_name: str = "multimodal-rag") -> Dict[str, Any]:
-    """Clear all vectors from the database (use with caution)"""
-    try:
-        # Get API key from environment if not provided
-        if not pinecone_api_key:
-            pinecone_api_key = os.getenv("PINECONE_API_KEY")
-        
-        if not pinecone_api_key:
-            return {
-                'success': False,
-                'error': 'Pinecone API key not provided'
-            }
-        
-        # Create Pinecone client
-        pc = Pinecone(api_key=pinecone_api_key)
-        
-        if pinecone_index_name not in pc.list_indexes().names():
-            return {
-                'success': False,
-                'error': f'Index {pinecone_index_name} does not exist'
-            }
-        
-        index = pc.Index(pinecone_index_name)
-        index.delete(delete_all=True)
-        
-        logger.info("Vector database cleared successfully")
-        return {
-            'success': True,
-            'message': 'Vector database cleared successfully'
-        }
-    except Exception as e:
-        logger.error(f"Error clearing vector database: {e}")
-        return {
-            'success': False,
-            'error': str(e)
+            'error': str(e),
+            'user_id': user_id
         }
